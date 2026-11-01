@@ -1,6 +1,6 @@
 # Handwritten Math OCR + Symbolic Studio
 
-A deterministic, sub-second handwriting-to-math workbench combining **`TexTeller 3.0`** (298M ONNX) with an extended symbolic ALU engine (**`SymPy`**).
+A deterministic, sub-second handwriting-to-math workbench combining **`glm-ocr`** (locked in RTX 2050 VRAM) with an extended symbolic ALU engine (**`SymPy`**), and optional **`lfm3`** derivation synthesis.
 
 ---
 

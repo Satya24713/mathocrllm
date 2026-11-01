@@ -1,109 +1,15 @@
 import re
 import json
 import os
-import numpy as np
+import ollama
 import gradio as gr
 import sympy as sp
 from sympy.parsing.latex import parse_latex
 from pydantic import BaseModel
 from PIL import Image, ImageOps
-from texteller import load_model, load_tokenizer, img2latex
 
-# Load TexTeller 3.0 Formula Recognition Engine
-print("Initializing TexTeller 3.0 model & tokenizer...")
-ocr_tokenizer = load_tokenizer()
-ocr_model = load_model(use_onnx=True)
-print("TexTeller 3.0 ready.")
-
-def segment_formula_lines(pil_img, min_gap_rows=6, min_line_height=14):
-    """
-    Detects vertically stacked formula lines (e.g. systems of equations) on white background.
-    Uses horizontal projection profile to detect blank horizontal valleys separating distinct lines of ink.
-    Returns list of PIL Image crops if multiple distinct lines are found, or [pil_img] if single formula.
-    """
-    gray = np.array(pil_img.convert("L"))
-    ink_mask = (gray < 200)
-    row_ink = ink_mask.sum(axis=1)
-
-    total_ink = row_ink.sum()
-    if total_ink < 40:
-        return [pil_img]
-
-    noise_thresh = max(2, int(0.015 * row_ink.max()))
-    is_ink_row = row_ink > noise_thresh
-
-    bands = []
-    in_band = False
-    start_y = 0
-
-    for y, has_ink in enumerate(is_ink_row):
-        if has_ink and not in_band:
-            in_band = True
-            start_y = y
-        elif not has_ink and in_band:
-            in_band = False
-            if (y - start_y) >= min_line_height:
-                bands.append((start_y, y))
-    if in_band and (len(is_ink_row) - start_y) >= min_line_height:
-        bands.append((start_y, len(is_ink_row)))
-
-    if len(bands) <= 1:
-        return [pil_img]
-
-    merged_bands = [bands[0]]
-    for b in bands[1:]:
-        prev_start, prev_end = merged_bands[-1]
-        curr_start, curr_end = b
-        gap = curr_start - prev_end
-        if gap < min_gap_rows:
-            merged_bands[-1] = (prev_start, curr_end)
-        else:
-            merged_bands.append(b)
-
-    if len(merged_bands) <= 1:
-        return [pil_img]
-
-    w, h = pil_img.size
-    crops = []
-    for (y1, y2) in merged_bands:
-        pad = 20
-        crop_y1 = max(0, y1 - pad)
-        crop_y2 = min(h, y2 + pad)
-        cropped = pil_img.crop((0, crop_y1, w, crop_y2))
-        cropped_padded = ImageOps.expand(cropped, border=15, fill="white")
-        crops.append(cropped_padded)
-
-    return crops
-
-def recognize_latex_from_image(img: Image.Image) -> str:
-    """
-    Performs robust math OCR using TexTeller 3.0.
-    Automatically detects multi-line equation stacks (e.g. simultaneous equations)
-    and processes each line in parallel via batched inference, joining lines with ' \\\\ '.
-    Falls back to single-image recognition for unified formulas.
-    """
-    padded_img = ImageOps.expand(img, border=25, fill="white")
-    line_crops = segment_formula_lines(padded_img)
-
-    if len(line_crops) > 1:
-        crop_arrays = [np.array(c.convert("RGB")) for c in line_crops]
-        try:
-            preds = img2latex(ocr_model, ocr_tokenizer, crop_arrays)
-            cleaned_lines = []
-            for p in preds:
-                p_clean = re.sub(r"(\\\[|\\\]|\$\$|\$)", "", p).strip()
-                if p_clean:
-                    cleaned_lines.append(p_clean)
-            if len(cleaned_lines) >= 2:
-                return " \\\\ ".join(cleaned_lines)
-            elif len(cleaned_lines) == 1:
-                return cleaned_lines[0]
-        except Exception as e:
-            print(f"Batched multi-line OCR fallback: {e}")
-
-    full_arr = np.array(padded_img.convert("RGB"))
-    preds = img2latex(ocr_model, ocr_tokenizer, [full_arr])
-    return preds[0].strip() if preds else ""
+# Explicit client connecting to loopback to prevent 0.0.0.0 connection failures on Windows
+ollama_client = ollama.Client(host=os.environ.get("OLLAMA_API_HOST", "http://127.0.0.1:11434"))
 
 # 1. Define your Structured Output Schema
 class MathToolOutput(BaseModel):
@@ -122,27 +28,7 @@ def execute_math_tool(latex_str: str) -> MathToolOutput:
     cleaned = re.sub(r"=\s*\??\s*$", "", cleaned).strip()
 
     try:
-        # Handle systems of equations (e.g., "9x + 8y = 0 \\ 4x + 9y = 0")
-        split_lines = [s.strip() for s in re.split(r"\\\\|\\newline|\n|;", cleaned) if s.strip()]
-        eq_lines = [s for s in split_lines if "=" in s]
-        if len(eq_lines) >= 2:
-            eqs = []
-            for s in eq_lines:
-                lhs_str, rhs_str = s.split("=", 1)
-                lhs = parse_latex(lhs_str.strip())
-                rhs = parse_latex(rhs_str.strip())
-                eqs.append(sp.Eq(lhs, rhs))
-            solutions = sp.solve(eqs)
-            return MathToolOutput(
-                raw_ocr_latex=latex_str,
-                cleaned_expression="; ".join(str(e) for e in eqs),
-                operation_type="system_of_equations",
-                exact_result=str(solutions),
-                numeric_approximation=str(solutions),
-                status="success"
-            )
-
-        # Handle Single Equations (e.g., "2x + 3 = 7") vs Expressions (e.g., "2 + 3" or "\int_0^2 x^2 dx")
+        # Handle Equations (e.g., "2x + 3 = 7") vs Expressions (e.g., "2 + 3" or "\int_0^2 x^2 dx")
         if "=" in cleaned:
             lhs_str, rhs_str = cleaned.split("=", 1)
             lhs = parse_latex(lhs_str)
@@ -212,7 +98,7 @@ def execute_math_tool(latex_str: str) -> MathToolOutput:
             status=f"Parse Error: {str(e)}"
         )
 
-# 3. End-to-End Pipeline: Canvas Image -> TexTeller 3.0 -> Math Tool
+# 3. End-to-End Pipeline: Canvas Image -> glm-ocr -> Math Tool
 def process_canvas(canvas_data):
     if canvas_data is None:
         return "Draw an equation first!", "{}"
@@ -235,17 +121,32 @@ def process_canvas(canvas_data):
     else:
         img = img.convert("RGB")
 
-    # Step A: Call TexTeller 3.0 (with multi-line perception)
+    # Add white padding around edges (engineering golden rule for vision models)
+    img = ImageOps.expand(img, border=25, fill=(255, 255, 255))
+
+    img_path = "temp_equation.png"
+    img.save(img_path)
+
+    # Step A: Call glm-ocr via Ollama (Vision -> LaTeX)
     try:
-        raw_latex = recognize_latex_from_image(img)
+        response = ollama_client.chat(
+            model="glm-ocr",
+            messages=[{
+                "role": "user",
+                "content": "Formula Recognition:",
+                "images": [img_path]
+            }],
+            options={"temperature": 0.0}
+        )
+        raw_latex = response["message"]["content"].strip()
     except Exception as e:
         err_res = MathToolOutput(
             raw_ocr_latex="",
             cleaned_expression="",
             operation_type="ocr_error",
-            exact_result="TexTeller OCR failed",
+            exact_result="Ollama OCR failed",
             numeric_approximation="N/A",
-            status=f"TexTeller Error: {str(e)}"
+            status=f"Ollama Error: {str(e)}"
         )
         return f"### OCR Error:\n{str(e)}", err_res.model_dump_json(indent=2)
 
@@ -262,7 +163,7 @@ def process_canvas(canvas_data):
 
 # 4. Launch Drawing UI (Works with your Laptop Pen/Touch or Mouse)
 with gr.Blocks(title="Handwritten Math OCR + SymPy Calculator") as demo:
-    gr.Markdown("## Handwritten Math OCR + Symbolic Tool Calculator (`TexTeller 3.0` + `SymPy`)")
+    gr.Markdown("## Handwritten Math OCR + Symbolic Tool Calculator (`glm-ocr` + `SymPy`)")
     gr.Markdown("Draw your handwritten formula or equation below using your pen, stylus, touch, or mouse.")
     with gr.Row():
         with gr.Column(scale=1):
