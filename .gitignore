@@ -25,6 +25,7 @@ wheels/
 
 # Temporary images and artifacts
 temp_canvas.png
+temp_equation.png
 *.tmp
 
 # OS generated
