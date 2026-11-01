@@ -1,6 +1,10 @@
 # Handwritten Math OCR + Symbolic Studio
 
-A deterministic, sub-second handwriting-to-math workbench combining **`glm-ocr`** (locked in RTX 2050 VRAM) with an extended symbolic ALU engine (**`SymPy`**), and optional **`lfm3`** derivation synthesis.
+A deterministic, sub-second handwriting-to-math workbench with **Dual OCR Engine Support** and an extended symbolic ALU engine (**`SymPy`**).
+
+Choose between two vision recognition backends directly from the UI:
+* **`GLM-OCR` (0.9B Ollama)**: Multimodal vision-language model running locally in Ollama.
+* **`TexTeller 3.0` (298M ONNX)**: High-speed Vision Transformer running in-process via ONNX Runtime with automatic multi-line equation stack segmentation.
 
 ---
 
@@ -48,5 +52,9 @@ A deterministic, sub-second handwriting-to-math workbench combining **`glm-ocr`*
 
 ```powershell
 python lfm_math_agent.py
+```
+Or the simplified calculator:
+```powershell
+python app.py
 ```
 Open your browser at `http://127.0.0.1:7860`.

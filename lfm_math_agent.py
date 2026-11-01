@@ -4,12 +4,14 @@ import os
 import json
 import time
 import base64
+import numpy as np
 import ollama
 import gradio as gr
 import sympy as sp
 from PIL import Image, ImageOps
 from sympy.parsing.latex import parse_latex as _raw_parse_latex
 from sympy.integrals.manualintegrate import integral_steps
+from texteller import load_model, load_tokenizer, img2latex
 
 def parse_latex(latex_str: str) -> sp.Expr:
     """
@@ -32,6 +34,123 @@ if os.environ.get("OLLAMA_HOST") == "0.0.0.0":
 
 OLLAMA_BASE_URL = os.environ.get("OLLAMA_API_HOST", "http://127.0.0.1:11434")
 ollama_client = ollama.Client(host=OLLAMA_BASE_URL)
+
+# ==========================================
+# 0. OCR ENGINES (GLM-OCR Ollama + TexTeller 3.0 ONNX)
+# ==========================================
+_texteller_model = None
+_texteller_tok = None
+
+def get_texteller():
+    global _texteller_model, _texteller_tok
+    if _texteller_model is None or _texteller_tok is None:
+        print("Loading TexTeller 3.0 model & tokenizer...")
+        _texteller_tok = load_tokenizer()
+        _texteller_model = load_model(use_onnx=True)
+        print("TexTeller 3.0 loaded successfully.")
+    return _texteller_model, _texteller_tok
+
+def segment_formula_lines(pil_img, min_gap_rows=6, min_line_height=14):
+    """
+    Detects vertically stacked formula lines (e.g. systems of equations) on white background.
+    Uses horizontal projection profile to detect blank horizontal valleys separating distinct lines of ink.
+    Returns list of PIL Image crops if multiple distinct lines are found, or [pil_img] if single formula.
+    """
+    gray = np.array(pil_img.convert("L"))
+    ink_mask = (gray < 200)
+    row_ink = ink_mask.sum(axis=1)
+
+    total_ink = row_ink.sum()
+    if total_ink < 40:
+        return [pil_img]
+
+    noise_thresh = max(2, int(0.015 * row_ink.max()))
+    is_ink_row = row_ink > noise_thresh
+
+    bands = []
+    in_band = False
+    start_y = 0
+
+    for y, has_ink in enumerate(is_ink_row):
+        if has_ink and not in_band:
+            in_band = True
+            start_y = y
+        elif not has_ink and in_band:
+            in_band = False
+            if (y - start_y) >= min_line_height:
+                bands.append((start_y, y))
+    if in_band and (len(is_ink_row) - start_y) >= min_line_height:
+        bands.append((start_y, len(is_ink_row)))
+
+    if len(bands) <= 1:
+        return [pil_img]
+
+    merged_bands = [bands[0]]
+    for b in bands[1:]:
+        prev_start, prev_end = merged_bands[-1]
+        curr_start, curr_end = b
+        gap = curr_start - prev_end
+        if gap < min_gap_rows:
+            merged_bands[-1] = (prev_start, curr_end)
+        else:
+            merged_bands.append(b)
+
+    if len(merged_bands) <= 1:
+        return [pil_img]
+
+    w, h = pil_img.size
+    crops = []
+    for (y1, y2) in merged_bands:
+        pad = 20
+        crop_y1 = max(0, y1 - pad)
+        crop_y2 = min(h, y2 + pad)
+        cropped = pil_img.crop((0, crop_y1, w, crop_y2))
+        cropped_padded = ImageOps.expand(cropped, border=15, fill="white")
+        crops.append(cropped_padded)
+
+    return crops
+
+def recognize_latex_with_engine(img: Image.Image, engine_choice: str) -> tuple[str, str]:
+    """
+    Performs OCR using the user-selected engine.
+    Returns: (raw_latex_string, engine_display_label)
+    """
+    if "TexTeller" in engine_choice:
+        model, tok = get_texteller()
+        padded_img = ImageOps.expand(img, border=25, fill="white")
+        line_crops = segment_formula_lines(padded_img)
+
+        if len(line_crops) > 1:
+            crop_arrays = [np.array(c.convert("RGB")) for c in line_crops]
+            try:
+                preds = img2latex(model, tok, crop_arrays)
+                cleaned_lines = []
+                for p in preds:
+                    p_clean = re.sub(r"(\\\[|\\\]|\$\$|\$)", "", p).strip()
+                    if p_clean:
+                        cleaned_lines.append(p_clean)
+                if len(cleaned_lines) >= 2:
+                    return " \\\\ ".join(cleaned_lines), "TexTeller 3.0"
+                elif len(cleaned_lines) == 1:
+                    return cleaned_lines[0], "TexTeller 3.0"
+            except Exception as e:
+                print(f"Batched TexTeller multi-line fallback: {e}")
+
+        full_arr = np.array(padded_img.convert("RGB"))
+        preds = img2latex(model, tok, [full_arr])
+        return (preds[0].strip() if preds else ""), "TexTeller 3.0"
+    else:
+        # Default: GLM-OCR via Ollama
+        padded_img = ImageOps.expand(img, border=25, fill="white")
+        img_path = "temp_canvas.png"
+        padded_img.save(img_path)
+        ocr_resp = ollama_client.chat(
+            model="glm-ocr",
+            messages=[{"role": "user", "content": "Formula Recognition:", "images": [img_path]}],
+            options={"temperature": 0.0, "num_ctx": 512},
+            keep_alive="15m"
+        )
+        return ocr_resp["message"]["content"].strip(), "GLM-OCR"
 
 # ==========================================
 # 1. LATEX SANITIZER FOR SYMPY ANTLR PARSER & MARKDOWN
@@ -1439,7 +1558,7 @@ def generate_ast_steps(tool_output: dict) -> list[str]:
 # ==========================================
 # 5. CORE SOLVER & AESTHETIC DASHBOARD RENDERER (0.01s Instant ALU)
 # ==========================================
-def solve_from_latex(raw_latex: str, user_hint: str = "", ocr_ms: float = 0.0):
+def solve_from_latex(raw_latex: str, user_hint: str = "", ocr_ms: float = 0.0, engine_label: str = "OCR"):
     t0 = time.perf_counter()
     if not raw_latex or not raw_latex.strip():
         empty_html = """
@@ -1497,7 +1616,7 @@ def solve_from_latex(raw_latex: str, user_hint: str = "", ocr_ms: float = 0.0):
 
     steps_md = "\n\n".join(ast_steps) if ast_steps else "*Direct evaluation without intermediate steps.*"
     math_md = (
-        f"#### 🔍 Perceived LaTeX (`glm-ocr`)\n"
+        f"#### 🔍 Perceived LaTeX (`{engine_label}`)\n"
         f"$$\\large {tool_output['sanitized_latex']}$$\n\n"
         f"---\n"
         f"#### 🎯 Exact Symbolic Solution (`SymPy`)\n"
@@ -1508,6 +1627,7 @@ def solve_from_latex(raw_latex: str, user_hint: str = "", ocr_ms: float = 0.0):
     )
 
     telemetry = {
+        "ocr_engine": engine_label,
         "timing": {
             "ocr_ms": round(ocr_ms, 1),
             "sympy_alu_ms": round(alu_ms, 2),
@@ -1523,7 +1643,7 @@ def solve_from_latex(raw_latex: str, user_hint: str = "", ocr_ms: float = 0.0):
 # ==========================================
 # 6. CANVAS PIPELINE (With OCR Timing)
 # ==========================================
-def run_canvas_pipeline(b64_canvas_str, uploaded_img, user_hint):
+def run_canvas_pipeline(b64_canvas_str, uploaded_img, user_hint, engine_choice="GLM-OCR (Ollama)"):
     img = None
     if uploaded_img is not None:
         img = uploaded_img.convert("RGB")
@@ -1536,30 +1656,20 @@ def run_canvas_pipeline(b64_canvas_str, uploaded_img, user_hint):
             return "", err_html, "", "{}"
 
     if img is None:
-        empty_html, empty_md, empty_json = solve_from_latex("", user_hint)
+        empty_html, empty_md, empty_json = solve_from_latex("", user_hint, engine_label=engine_choice)
         return "", empty_html, empty_md, empty_json
-
-    padded_img = ImageOps.expand(img, border=25, fill="white")
-    img_path = "temp_canvas.png"
-    padded_img.save(img_path)
 
     t_ocr = time.perf_counter()
     try:
-        ocr_resp = ollama_client.chat(
-            model="glm-ocr",
-            messages=[{"role": "user", "content": "Formula Recognition:", "images": [img_path]}],
-            options={"temperature": 0.0, "num_ctx": 512},
-            keep_alive="15m"
-        )
-        raw_latex = ocr_resp["message"]["content"].strip()
+        raw_latex, engine_label = recognize_latex_with_engine(img, engine_choice)
     except Exception as e:
-        err_html = f"<div class='glass-card empty-state'><div style='color: #ef4444;'>OCR Error: {e}</div></div>"
+        err_html = f"<div class='glass-card empty-state'><div style='color: #ef4444;'>OCR Error ({engine_choice}): {e}</div></div>"
         return "", err_html, "", "{}"
 
     ocr_ms = (time.perf_counter() - t_ocr) * 1000.0
     clean_preview = sanitize_latex(raw_latex)
 
-    dash_html, math_md, telemetry_json = solve_from_latex(clean_preview, user_hint, ocr_ms=ocr_ms)
+    dash_html, math_md, telemetry_json = solve_from_latex(clean_preview, user_hint, ocr_ms=ocr_ms, engine_label=engine_label)
     return clean_preview, dash_html, math_md, telemetry_json
 
 # ==========================================
@@ -1828,8 +1938,9 @@ HEADER_HTML = """
     <div class="header-sub">Zero-Cloud Handwritten Formula Perception • Deterministic SymPy ALU (Instant <0.05s)</div>
   </div>
   <div class="hw-badges">
-    <span class="hw-badge">🟢 GLM-OCR (0.9B)</span>
-    <span class="hw-badge">🟣 Deterministic SymPy ALU (Instant)</span>
+    <span class="hw-badge">🟢 GLM-OCR (0.9B Ollama)</span>
+    <span class="hw-badge">⚡ TexTeller 3.0 (298M ONNX)</span>
+    <span class="hw-badge">🟣 Deterministic SymPy ALU</span>
   </div>
 </div>
 """
@@ -1842,6 +1953,13 @@ with gr.Blocks(title="Math OCR Studio") as demo:
         with gr.Column(scale=5):
             gr.HTML(HTML_CANVAS)
             b64_bridge = gr.Textbox(elem_id="b64-bridge", container=False)
+
+            engine_selector = gr.Radio(
+                choices=["GLM-OCR (Ollama)", "TexTeller 3.0 (ONNX)"],
+                value="GLM-OCR (Ollama)",
+                label="🧠 Active OCR Engine",
+                info="Choose between GLM-OCR (0.9B Multimodal VLM) and TexTeller 3.0 (298M ONNX with auto line segmentation)"
+            )
 
             with gr.Row():
                 run_btn = gr.Button("🚀 Read Whiteboard & Compute Instantly", variant="primary", scale=1)
@@ -1913,7 +2031,7 @@ with gr.Blocks(title="Math OCR Studio") as demo:
     # Wire Events
     run_btn.click(
         fn=run_canvas_pipeline,
-        inputs=[b64_bridge, upload_img, hint],
+        inputs=[b64_bridge, upload_img, hint, engine_selector],
         outputs=[latex_override, dashboard_card, md_out, telemetry_json]
     )
 
@@ -1924,7 +2042,7 @@ with gr.Blocks(title="Math OCR Studio") as demo:
     )
 
 if __name__ == "__main__":
-    print("Pre-warming glm-ocr into RTX 2050 VRAM...")
+    print("Pre-warming OCR engines...")
     try:
         ollama_client.chat(
             model="glm-ocr",
@@ -1932,9 +2050,17 @@ if __name__ == "__main__":
             options={"num_ctx": 512, "num_predict": 1},
             keep_alive="15m"
         )
-        print("glm-ocr locked in VRAM! Launching Studio UI...")
+        print("GLM-OCR pre-warmed.")
     except Exception as e:
-        print(f"Warmup note: {e}")
+        print(f"GLM-OCR warmup note: {e}")
+
+    try:
+        get_texteller()
+        print("TexTeller 3.0 pre-warmed.")
+    except Exception as e:
+        print(f"TexTeller warmup note: {e}")
+
+    print("Launching Studio UI with dual OCR engine options...")
     demo.launch(
         theme=gr.themes.Soft(primary_hue="indigo", neutral_hue="slate"),
         css=CUSTOM_CSS,

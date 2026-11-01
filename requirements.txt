@@ -1,4 +1,6 @@
 ollama>=0.6.3
+texteller>=1.0.2
+onnxruntime>=1.20.0
 sympy>=1.14.0
 antlr4-python3-runtime==4.11.1
 gradio>=6.31.0
